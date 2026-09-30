@@ -11,6 +11,7 @@ from stock_analyst import analyze_stock
 from swing_glance import render as render_swing_glance
 from momentum_lab import render as render_momentum_lab
 from config import BENCHMARK
+from scanner import run as run_radar_scan
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -217,6 +218,32 @@ st.markdown(
 # ========================= RADAR =========================
 if module == "🔥 Radar":
     st.subheader("📡 Live Radar")
+
+    # Run the complete Radar scanner on demand.
+    # This fetches fresh Yahoo Finance data, writes a new state.json,
+    # and then reloads the Radar UI.
+    scan_col1, scan_col2 = st.columns([1, 3])
+    with scan_col1:
+        run_fresh_radar = st.button(
+            "🔄 Run Fresh Radar Scan",
+            type="primary",
+            use_container_width=True,
+            help="Fetch fresh Yahoo Finance daily data, run the Radar scanner, and reload the results.",
+        )
+
+    if run_fresh_radar:
+        with st.spinner("Running fresh Radar scan across the NSE universe..."):
+            try:
+                run_radar_scan(
+                    refresh_universe=False,
+                    max_stocks=None,
+                    fresh_data=True,
+                )
+                st.success("Fresh Radar scan completed.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Radar scan failed: {exc}")
+
     latest_dates = [x.get("data_last_bar", "")[:10] for x in results[:100] if x.get("data_last_bar")]
     data_status = "🟢 FRESH / TODAY" if state.get("data_mode") == "FRESH_REQUEST" and now.date().isoformat() in latest_dates else "🟠 FRESH / OLD BAR" if state.get("data_mode") == "FRESH_REQUEST" else "🟡 CACHE MODE"
 
