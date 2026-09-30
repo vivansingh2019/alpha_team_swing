@@ -1,0 +1,533 @@
+from typing import List, Dict
+import numpy as np
+import pandas as pd
+
+from config import ATR_PERIOD, RS_PERIOD, VOLUME_LOOKBACK, MIN_RR
+
+
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def rsi(s, n=14):
+    d = s.diff()
+    up = d.clip(lower=0)
+    down = -d.clip(upper=0)
+    au = up.ewm(alpha=1 / n, adjust=False).mean()
+    ad = down.ewm(alpha=1 / n, adjust=False).mean()
+    rs = au / ad.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def atr(df, n=14):
+    pc = df.Close.shift(1)
+    tr = pd.concat([(df.High - df.Low), (df.High - pc).abs(), (df.Low - pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False).mean()
+
+
+def enrich(df):
+    d = df.copy().dropna().sort_index()
+    d["EMA20"] = ema(d.Close, 20)
+    d["EMA50"] = ema(d.Close, 50)
+    d["EMA200"] = ema(d.Close, 200)
+    d["RSI"] = rsi(d.Close)
+    d["ATR"] = atr(d, ATR_PERIOD)
+    d["VOL20"] = d.Volume.rolling(VOLUME_LOOKBACK).mean()
+    d["VOL_RATIO"] = d.Volume / d.VOL20.replace(0, np.nan)
+    d["HIGH20"] = d.High.shift(1).rolling(20).max()
+    d["HIGH50"] = d.High.shift(1).rolling(50).max()
+    d["LOW20"] = d.Low.shift(1).rolling(20).min()
+    d["LOW50"] = d.Low.shift(1).rolling(50).min()
+    d["VWAP20"] = (d.Close * d.Volume).rolling(20).sum() / d.Volume.rolling(20).sum()
+    d["RANGE20"] = (d.High.rolling(20).max() - d.Low.rolling(20).min()) / d.Close
+    d["ATR_PCT"] = d.ATR / d.Close
+    d["RS63"] = d.Close / d.Close.shift(RS_PERIOD) - 1
+    return d
+
+
+def market_regime(bench):
+    d = enrich(bench)
+    if len(d) < 210:
+        return {"regime": "UNKNOWN", "score": 5, "risk": "UNKNOWN"}
+    x = d.iloc[-1]
+    ema50_slope = d.EMA50.iloc[-1] - d.EMA50.iloc[-21]
+    if x.Close > x.EMA50 > x.EMA200 and ema50_slope > 0:
+        return {"regime": "BULLISH", "score": 10, "risk": "LOW"}
+    if x.Close < x.EMA50 < x.EMA200 and ema50_slope < 0:
+        return {"regime": "BEARISH", "score": 3, "risk": "HIGH"}
+    if x.Close >= x.EMA50 and ema50_slope >= 0:
+        return {"regime": "BULLISH_BUT_MIXED", "score": 7, "risk": "MODERATE"}
+    return {"regime": "MIXED", "score": 5, "risk": "MODERATE"}
+
+
+def detect_structure(d):
+    x = d.iloc[-1]
+    recent_high = d.High.iloc[-21:-1].max()
+    recent_low = d.Low.iloc[-21:-1].min()
+    prev_high = d.High.iloc[-42:-21].max()
+    prev_low = d.Low.iloc[-42:-21].min()
+    bos_up = x.Close > recent_high
+    bos_down = x.Close < recent_low
+    trend_up = recent_high > prev_high and recent_low > prev_low
+    trend_down = recent_high < prev_high and recent_low < prev_low
+    return {
+        "bos_up": bool(bos_up), "bos_down": bool(bos_down),
+        "trend_up": bool(trend_up), "trend_down": bool(trend_down),
+        "recent_high": float(recent_high), "recent_low": float(recent_low),
+    }
+
+
+def detect_smc(d):
+    x = d.iloc[-1]
+    a = float(x.ATR) if pd.notna(x.ATR) and x.ATR > 0 else max(float(x.Close) * 0.01, 1)
+    prev20h = d.High.iloc[-21:-1].max()
+    prev20l = d.Low.iloc[-21:-1].min()
+    sweep_low = x.Low < prev20l and x.Close > prev20l
+    sweep_high = x.High > prev20h and x.Close < prev20h
+    disp = abs(x.Close - d.Close.iloc[-2]) > 0.8 * a
+    ob_bull = bool(d.Close.iloc[-2] < d.Open.iloc[-2] and disp and x.Close > d.High.iloc[-2])
+    ob_bear = bool(d.Close.iloc[-2] > d.Open.iloc[-2] and disp and x.Close < d.Low.iloc[-2])
+    fvg_bull = bool(d.Low.iloc[-1] > d.High.iloc[-3])
+    fvg_bear = bool(d.High.iloc[-1] < d.Low.iloc[-3])
+    return {
+        "sweep_low": bool(sweep_low), "sweep_high": bool(sweep_high),
+        "displacement": bool(disp), "ob_bull": ob_bull, "ob_bear": ob_bear,
+        "fvg_bull": fvg_bull, "fvg_bear": fvg_bear,
+    }
+
+
+def relative_strength(stock, bench):
+    n = min(RS_PERIOD, len(stock) - 1, len(bench) - 1)
+    if n <= 0:
+        return 0.0, 0.0, 0.0
+    sr = stock.Close.iloc[-1] / stock.Close.iloc[-n - 1] - 1
+    br = bench.Close.iloc[-1] / bench.Close.iloc[-n - 1] - 1
+    return float(sr), float(br), float(sr - br)
+
+
+def _phase(d, structure):
+    x = d.iloc[-1]
+    atrv = max(float(x.ATR), float(x.Close) * 0.005)
+    resistance = max(structure["recent_high"], float(x.HIGH50))
+    dist_to_res = (resistance - float(x.Close)) / float(x.Close)
+    near_res = -0.015 <= dist_to_res <= 0.06
+    compression = len(d) >= 20 and float(d.RANGE20.iloc[-1]) < float(d.RANGE20.iloc[-20:].median()) * 0.85
+    higher_lows = structure["trend_up"]
+    fresh_breakout = structure["bos_up"] or float(x.Close) > float(x.HIGH20)
+    post_breakout = float(x.Close) > resistance and float(x.Close) <= resistance + 2.5 * atrv
+    extension = float(x.Close) > float(x.EMA20) + 2.0 * atrv
+    pullback = float(x.Close) > float(x.EMA50) and float(x.Low) <= float(x.EMA20) and float(x.Close) > float(x.Open)
+
+    if fresh_breakout:
+        return "BREAKOUT"
+    if post_breakout and not extension:
+        return "CONTINUATION"
+    if pullback:
+        return "PULLBACK"
+    if near_res and (higher_lows or compression):
+        return "BUILDING"
+    if extension:
+        return "EXTENDED"
+    return "NEUTRAL"
+
+
+def classify_status(result):
+    """Classify stock quality + entry readiness using the V2 ranking signals."""
+    score = int(result.get("score", 0))
+    priority = int(result.get("priority_score", score))
+    phase = result.get("phase", "NEUTRAL")
+    rs_delta = float(result.get("rs_delta", 0.0))
+    cmp = float(result.get("cmp", 0.0))
+    ema200 = float(result.get("ema200", 0.0))
+    entry_quality = int(result.get("entry_quality", 0))
+    rr = float(result.get("rr", 0.0))
+    profit_risk = result.get("profit_booking_risk", "LOW")
+    structure = result.get("structure", {}) or {}
+    market_regime = result.get("market_regime", "UNKNOWN")
+
+    above_ema200 = cmp > ema200 if ema200 > 0 else False
+    trend_up = bool(structure.get("trend_up"))
+    bos_up = bool(structure.get("bos_up"))
+    actionable_phase = phase in ("BREAKOUT", "CONTINUATION", "PULLBACK")
+    building_phase = phase == "BUILDING"
+
+    # ENTRY READY remains strict. Bearish market does not reject a stock,
+    # but it prevents the highest-conviction label while market risk is HIGH.
+    if (
+        market_regime != "BEARISH"
+        and priority >= 78
+        and entry_quality >= 72
+        and rr >= MIN_RR
+        and actionable_phase
+        and (bos_up or trend_up)
+        and profit_risk != "HIGH"
+    ):
+        return "ENTRY READY"
+
+    # EXTENDED / high profit-booking setups stay visible but are not entries.
+    if phase == "EXTENDED" or profit_risk == "HIGH":
+        return "WATCH" if priority >= 55 else "NEUTRAL"
+
+    # Strong actionable/building setups.
+    if (priority >= 65 and (actionable_phase or building_phase)) or (
+        priority >= 55
+        and (building_phase or phase in ("PULLBACK", "CONTINUATION"))
+        and rs_delta > 0
+    ):
+        return "WATCH"
+
+    # Developing stocks.
+    if priority >= 45 and (
+        actionable_phase
+        or building_phase
+        or (above_ema200 and rs_delta > 0)
+        or trend_up
+    ):
+        return "DEVELOPING"
+
+    if priority >= 35 or (above_ema200 and rs_delta > 0):
+        return "NEUTRAL"
+
+    return "REJECT"
+
+
+
+def valuation_risk_from_fundamentals(fundamental):
+    """Classify valuation risk without making valuation a hard reject.
+
+    Uses P/E and PEG when available. Growth remains visible separately;
+    valuation risk only modifies ranking priority.
+    """
+    f = fundamental or {}
+    pe = f.get("pe")
+    peg = f.get("peg")
+
+    try:
+        pe = float(pe) if pe is not None else None
+    except (TypeError, ValueError):
+        pe = None
+    try:
+        peg = float(peg) if peg is not None else None
+    except (TypeError, ValueError):
+        peg = None
+
+    if pe is None and peg is None:
+        return "UNKNOWN"
+
+    # Very high absolute valuation or very high growth-adjusted valuation.
+    if (pe is not None and pe >= 80) or (peg is not None and peg >= 3.5):
+        return "HIGH"
+
+    # Expensive, but not extreme.
+    if (pe is not None and pe >= 40) or (peg is not None and peg >= 2.0):
+        return "MODERATE"
+
+    return "LOW"
+
+
+def ranking_engine_v2(tech_score, fundamental_score, entry_quality, rs_delta,
+                      phase, rr, rsi, volume_ratio, market_regime,
+                      continuation, profit_booking_risk, valuation_risk="UNKNOWN"):
+    """Return separate stock-quality, entry-quality and final priority scores.
+
+    The purpose is to avoid treating a strong stock and a good immediate entry
+    as the same thing. Scores are bounded to 0-100.
+    """
+    tech = float(np.clip(tech_score, 0, 100))
+    fund = float(np.clip(fundamental_score, 0, 100))
+    entry = float(np.clip(entry_quality, 0, 100))
+
+    # RS is supplied in percentage points (e.g. +10 means +10% relative edge).
+    rs = float(np.clip(50 + rs_delta * 2.5, 0, 100))
+
+    setup_base = {
+        "BREAKOUT": 90,
+        "CONTINUATION": 84,
+        "PULLBACK": 82,
+        "BUILDING": 76,
+        "NEUTRAL": 50,
+        "EXTENDED": 38,
+    }.get(phase, 50)
+
+    # Fresh volume expansion improves breakout/continuation quality.
+    if phase in ("BREAKOUT", "CONTINUATION"):
+        if volume_ratio >= 2.0:
+            setup_base += 6
+        elif volume_ratio >= 1.2:
+            setup_base += 3
+
+    # RSI is treated as timing, not as a simple bullish/bearish signal.
+    entry_timing = entry
+    if rsi > 80:
+        entry_timing -= 25
+    elif rsi > 75:
+        entry_timing -= 14
+    elif rsi > 72:
+        entry_timing -= 7
+    elif 52 <= rsi <= 68:
+        entry_timing += 4
+    elif rsi < 40:
+        entry_timing -= 8
+
+    if rr < MIN_RR:
+        entry_timing -= 12
+    elif rr >= 3:
+        entry_timing += 5
+    elif rr >= 2:
+        entry_timing += 3
+
+    if profit_booking_risk == "HIGH":
+        entry_timing -= 22
+    elif profit_booking_risk == "MODERATE":
+        entry_timing -= 8
+
+    entry_timing = float(np.clip(entry_timing, 0, 100))
+
+    # Valuation is a risk modifier, not a hard rejection.
+    # Strong growth/setup can still rank well, but expensive stocks are flagged.
+    valuation_modifier = {
+        "HIGH": -10,
+        "MODERATE": -5,
+        "LOW": 0,
+        "UNKNOWN": 0,
+    }.get(valuation_risk, 0)
+
+    # Market is a risk modifier, not a hard rejection.
+    market_modifier = {
+        "BULLISH": 5,
+        "BULLISH_BUT_MIXED": 2,
+        "MIXED": 0,
+        "UNKNOWN": 0,
+        "BEARISH": -5,
+    }.get(market_regime, 0)
+
+    stock_quality = (
+        tech * 0.40
+        + fund * 0.20
+        + rs * 0.20
+        + setup_base * 0.20
+    )
+    priority = (
+        stock_quality * 0.45
+        + entry_timing * 0.35
+        + setup_base * 0.10
+        + rs * 0.10
+        + market_modifier
+        + valuation_modifier
+    )
+
+    stock_quality = int(round(np.clip(stock_quality, 0, 100)))
+    entry_timing = int(round(np.clip(entry_timing, 0, 100)))
+    priority = int(round(np.clip(priority, 0, 100)))
+
+    return {
+        "stock_quality_score": stock_quality,
+        "entry_quality_v2": entry_timing,
+        "priority_score": priority,
+        "valuation_risk": valuation_risk,
+        "valuation_modifier": valuation_modifier,
+    }
+
+
+def setup_analysis(ticker, df, bench, market, fundamental=None):
+    d = enrich(df)
+    if len(d) < 210:
+        return None
+    x = d.iloc[-1]
+    structure = detect_structure(d)
+    smc = detect_smc(d)
+    sr, br, rs_delta = relative_strength(d, bench)
+
+    # Technical score: ranking, not a pass/fail checklist.
+    tech = 0
+    reasons: List[str] = []
+    risks: List[str] = []
+
+    if market["regime"] == "BULLISH":
+        tech += 5
+    elif market["regime"] in ("BULLISH_BUT_MIXED", "MIXED"):
+        tech += 3
+    else:
+        risks.append("Market risk elevated")
+
+    if x.Close > x.EMA20 > x.EMA50 > x.EMA200:
+        tech += 15; reasons.append("Strong EMA trend alignment")
+    elif x.Close > x.EMA50 > x.EMA200:
+        tech += 11; reasons.append("Primary trend bullish")
+    elif x.Close > x.EMA200:
+        tech += 6
+    else:
+        risks.append("Price below long-term trend")
+
+    if rs_delta > 0.08:
+        tech += 15; reasons.append("Relative strength leading NIFTY")
+    elif rs_delta > 0.03:
+        tech += 11; reasons.append("Relative strength positive")
+    elif rs_delta > 0:
+        tech += 6
+    else:
+        risks.append("Relative strength not leading")
+
+    if x.VOL_RATIO >= 1.8:
+        tech += 10; reasons.append(f"Volume expansion {x.VOL_RATIO:.1f}x")
+    elif x.VOL_RATIO >= 1.2:
+        tech += 6; reasons.append(f"Volume supportive {x.VOL_RATIO:.1f}x")
+
+    if 52 <= x.RSI <= 72:
+        tech += 7
+    elif 72 < x.RSI <= 78:
+        tech += 4; risks.append("Momentum getting stretched")
+    elif x.RSI > 78:
+        risks.append("Momentum stretched")
+
+    if structure["bos_up"]:
+        tech += 14; reasons.append("Bullish breakout/BOS")
+    elif structure["trend_up"]:
+        tech += 8; reasons.append("Higher-high/higher-low structure")
+    elif structure["trend_down"]:
+        tech -= 8; risks.append("Lower-high/lower-low structure")
+
+    if smc["sweep_low"]: tech += 4; reasons.append("Liquidity sweep/reclaim")
+    if smc["ob_bull"]: tech += 3; reasons.append("Bullish order-block proxy")
+    if smc["fvg_bull"]: tech += 2; reasons.append("Bullish FVG proxy")
+    if smc["displacement"]: tech += 4; reasons.append("Price displacement")
+
+    phase = _phase(d, structure)
+    if phase == "BUILDING":
+        tech += 5; reasons.append("Constructive building/compression")
+    elif phase == "BREAKOUT":
+        reasons.append("Fresh breakout phase")
+    elif phase == "CONTINUATION":
+        tech += 5; reasons.append("Healthy post-breakout continuation")
+    elif phase == "PULLBACK":
+        tech += 4; reasons.append("Pullback in primary trend")
+    elif phase == "EXTENDED":
+        risks.append("Price extended from short-term mean")
+
+    # Levels
+    resistance = max(structure["recent_high"], float(x.HIGH50))
+    support = min(structure["recent_low"], float(x.LOW50))
+    atrv = max(float(x.ATR), float(x.Close) * 0.005)
+    breakout = float(x.Close) > float(x.HIGH20)
+    if phase in ("BREAKOUT", "CONTINUATION"):
+        entry_low = float(x.Close) - 0.15 * atrv
+        entry_high = float(x.Close) + 0.25 * atrv
+        sl = max(support, float(x.Close) - 1.5 * atrv)
+    elif phase == "PULLBACK":
+        entry_low = float(x.Close) - 0.35 * atrv
+        entry_high = float(x.Close) + 0.15 * atrv
+        sl = min(support, float(x.Close) - 1.5 * atrv)
+    elif phase == "BUILDING":
+        entry_low = float(x.Close)
+        entry_high = min(resistance, float(x.Close) + 0.35 * atrv)
+        sl = float(x.Close) - 1.5 * atrv
+    else:
+        entry_low = float(x.Close)
+        entry_high = float(x.Close) + 0.25 * atrv
+        sl = float(x.Close) - 1.5 * atrv
+
+    risk = max(entry_high - sl, 0.01)
+    room = max(resistance - entry_high, 0.0)
+    target1 = entry_high + max(2.0 * risk, room * 0.8)
+    target2 = entry_high + max(3.0 * risk, room * 1.5)
+    rr = max((target1 - entry_high) / risk, 0.0)
+
+    # Fundamental contribution is intentionally modest: technical timing stays primary.
+    fund_score = int((fundamental or {}).get("fundamental_score", 50))
+    fundamental_available = bool((fundamental or {}).get("available", False))
+    valuation_risk = valuation_risk_from_fundamentals(fundamental) if fundamental_available else "UNKNOWN"
+    total = round(tech * 0.72 + fund_score * 0.28) if fundamental_available else min(100, tech)
+    total = max(0, min(100, int(total)))
+
+    # Actionability starts from the existing technical/fundamental score,
+    # then V2 separates stock quality from actual entry timing.
+    entry_quality = total
+    if phase == "EXTENDED": entry_quality -= 15
+    if rr < MIN_RR: entry_quality -= 12
+    if room > 0 and room / max(float(x.Close), 1) < 0.03: entry_quality -= 8
+    if market["regime"] == "BEARISH": entry_quality -= 3
+    entry_quality = max(0, min(100, int(entry_quality)))
+
+    continuation = (
+        "STRONG" if total >= 82 and phase in ("BREAKOUT", "CONTINUATION")
+        else "MODERATE" if total >= 68 else "LOW"
+    )
+    profit_risk = (
+        "HIGH" if phase == "EXTENDED" or x.RSI > 80
+        else "MODERATE" if x.RSI > 72 or x.Close > x.EMA20 + atrv
+        else "LOW"
+    )
+
+    ranking = ranking_engine_v2(
+        tech_score=tech,
+        fundamental_score=fund_score,
+        entry_quality=entry_quality,
+        rs_delta=float(rs_delta * 100),
+        phase=phase,
+        rr=rr,
+        rsi=float(x.RSI),
+        volume_ratio=float(x.VOL_RATIO),
+        market_regime=market["regime"],
+        continuation=continuation,
+        profit_booking_risk=profit_risk,
+        valuation_risk=valuation_risk,
+    )
+
+    # Keep the legacy score for backward compatibility, but use priority_score
+    # for the new status classification and dashboard ranking.
+    provisional = {
+        "score": total,
+        "priority_score": ranking["priority_score"],
+        "phase": phase,
+        "cmp": float(x.Close),
+        "ema200": float(x.EMA200),
+        "rs_delta": float(rs_delta * 100),
+        "entry_quality": ranking["entry_quality_v2"],
+        "rr": rr,
+        "profit_booking_risk": profit_risk,
+        "market_regime": market["regime"],
+        "structure": structure,
+    }
+    status = classify_status(provisional)
+
+    return {
+        "ticker": ticker,
+        "date": str(d.index[-1].date()),
+        "cmp": round(float(x.Close), 2),
+        "status": status,
+        "score": total,
+        "priority_score": ranking["priority_score"],
+        "stock_quality_score": ranking["stock_quality_score"],
+        "technical_score": int(max(0, min(100, tech))),
+        "fundamental_score": fund_score,
+        "valuation_risk": ranking["valuation_risk"],
+        "valuation_modifier": ranking["valuation_modifier"],
+        "entry_quality": ranking["entry_quality_v2"],
+        "phase": phase,
+        "setup": phase,
+        "market_regime": market["regime"],
+        "market_risk": market.get("risk", "UNKNOWN"),
+        "rs_stock": round(sr * 100, 2),
+        "rs_bench": round(br * 100, 2),
+        "rs_delta": round(rs_delta * 100, 2),
+        "rsi": round(float(x.RSI), 1),
+        "volume_ratio": round(float(x.VOL_RATIO), 2),
+        "ema20": round(float(x.EMA20), 2),
+        "ema50": round(float(x.EMA50), 2),
+        "ema200": round(float(x.EMA200), 2),
+        "resistance": round(resistance, 2),
+        "support": round(support, 2),
+        "entry_low": round(entry_low, 2),
+        "entry_high": round(entry_high, 2),
+        "stop_loss": round(sl, 2),
+        "target1": round(target1, 2),
+        "target2": round(target2, 2),
+        "rr": round(rr, 1),
+        "continuation": continuation,
+        "profit_booking_risk": profit_risk,
+        "reasons": reasons,
+        "risks": risks,
+        "fundamental_available": fundamental_available,
+        "smc": smc,
+        "structure": structure,
+    }
